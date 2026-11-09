@@ -50,12 +50,17 @@ def detect(df: pd.DataFrame, fib: dict[str, float], language: str) -> list[dict]
         elif v >= RSI_OVERBOUGHT:
             add(ts, "rsi_overbought", v, value=f"{v:.2f}")
 
+    # Compared as whole columns, not day by day: the loop with close[ts] and
+    # band.loc[ts, ...] cost four label lookups per trading day -- measured on
+    # 2026-11-09 that was 80 percent of a "max" chart (MCD: 2.1 s of 2.6 s).
     band = df[["BB_Upper", "BB_Lower"]].dropna()
-    for ts in band.index:
-        if close[ts] <= band.loc[ts, "BB_Lower"]:
-            add(ts, "bb_lower", close[ts])
-        elif close[ts] >= band.loc[ts, "BB_Upper"]:
-            add(ts, "bb_upper", close[ts])
+    band_close = close.reindex(band.index)
+    lower = band_close <= band["BB_Lower"]
+    upper = ~lower & (band_close >= band["BB_Upper"])
+    for ts, v in band_close[lower].items():
+        add(ts, "bb_lower", v)
+    for ts, v in band_close[upper].items():
+        add(ts, "bb_upper", v)
 
     both = df[["MACD", "MACD_Signal"]].dropna()
     if len(both) > 1:

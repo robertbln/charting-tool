@@ -66,13 +66,12 @@ def free_cash_flow(symbol: str) -> dict | None:
 
     now = int(time.time())
     try:
-        with httpx.Client(timeout=10, headers=yahoo.HEADERS, follow_redirects=True) as client:
-            resp = client.get(URL.format(symbol=symbol), params={
-                "type": ",".join(TYPES),
-                "period1": now - YEARS * 365 * 86400, "period2": now,
-            })
-            resp.raise_for_status()
-            series = _series(resp.json())
+        resp = yahoo.client.get(URL.format(symbol=symbol), params={
+            "type": ",".join(TYPES),
+            "period1": now - YEARS * 365 * 86400, "period2": now,
+        }, timeout=10)
+        resp.raise_for_status()
+        series = _series(resp.json())
     except (httpx.HTTPError, ValueError, AttributeError) as exc:
         # Not cached: the next call tries again.
         log.warning("Fundamentals for %s not available: %s", symbol, exc)

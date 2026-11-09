@@ -190,7 +190,7 @@ Everything is set through the environment, usually in `.env`. Only
 | `MAX_ATTEMPTS` | `5` | Failed sign-ins from one address before the lockout |
 | `LOCKOUT_MINUTES` | `15` | How long that lockout lasts |
 | `CACHE_TTL_INTRADAY` | `900` | Seconds a bar counts as current while the exchange is open |
-| `CACHE_TTL_CLOSED` | `43200` | The same once it has closed |
+| `CACHE_TTL_CLOSED` | `43200` | The same once it has closed — but never past the start of the next session |
 | `COOKIE_SECURE` | `true` | Set to `false` only when serving over plain HTTP |
 | `LOG_FILE` | `access.log` | Access log, written into `DATA_DIR` |
 | `LOG_MAX_MB` / `LOG_BACKUPS` | `5` / `5` | Rotation of that log |

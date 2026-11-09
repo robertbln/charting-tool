@@ -27,6 +27,15 @@ HEADERS = {
     "Accept": "application/json",
 }
 
+# One client for the whole process, so that the TLS connection to Yahoo is
+# kept and reused. Previously every request opened a client of its own and
+# with it a new connection and TLS handshake -- per chart up to four of them
+# in a row. httpx.Client is safe to share between the worker threads.
+client = httpx.Client(timeout=25, headers=HEADERS, follow_redirects=True,
+                      limits=httpx.Limits(max_connections=8,
+                                          max_keepalive_connections=4,
+                                          keepalive_expiry=60))
+
 # Allowed are letters, digits and the characters Yahoo uses in symbols: dot
 # (BMW.DE), hyphen (BTC-USD), caret (^VIX), equals sign (EURUSD=X).
 SYMBOL_RE = re.compile(r"^[A-Za-z0-9.\-^=]{1,20}$")
@@ -90,10 +99,9 @@ def fetch(symbol: str, interval: str, *, period1: int | None = None,
         params["period2"] = int(period2)
 
     try:
-        with httpx.Client(timeout=25, headers=HEADERS, follow_redirects=True) as client:
-            resp = client.get(CHART_URL.format(symbol=symbol), params=params)
-            resp.raise_for_status()
-            body = resp.json()
+        resp = client.get(CHART_URL.format(symbol=symbol), params=params)
+        resp.raise_for_status()
+        body = resp.json()
     except (httpx.HTTPError, ValueError) as exc:
         raise YahooError(
             f"Yahoo request failed: {exc}", "error.yahoo_failed", detail=str(exc)
@@ -190,13 +198,13 @@ def search(query: str, limit: int = 8) -> list[dict]:
         return cached
 
     try:
-        with httpx.Client(timeout=10, headers=HEADERS, follow_redirects=True) as client:
-            resp = client.get(
-                SEARCH_URL,
-                params={"q": query, "quotesCount": limit, "newsCount": 0},
-            )
-            resp.raise_for_status()
-            quotes = resp.json().get("quotes") or []
+        resp = client.get(
+            SEARCH_URL,
+            params={"q": query, "quotesCount": limit, "newsCount": 0},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        quotes = resp.json().get("quotes") or []
     except (httpx.HTTPError, ValueError) as exc:
         log.warning("Symbol search failed: %s", exc)
         return []

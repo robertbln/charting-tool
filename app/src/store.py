@@ -305,11 +305,35 @@ def _frame(symbol: str, interval: str, start_ts: int) -> pd.DataFrame:
 
 # --- Freshness ------------------------------------------------------------
 
+def _session_start(cov: dict) -> int | None:
+    """Start of the regular session that lay ahead at the last fetch, if any."""
+    try:
+        meta = json.loads(cov["meta"]) if cov.get("meta") else {}
+        start = meta["currentTradingPeriod"]["regular"]["start"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if isinstance(start, bool) or not isinstance(start, (int, float)):
+        return None
+    return int(start) if start > cov["fetched_at"] else None
+
+
 def _is_current(cov: dict, now: int) -> bool:
-    """Is the last stored bar young enough?"""
+    """Is the last stored bar young enough?
+
+    A store fetched while the exchange was closed is only good until the next
+    session opens, even if CACHE_TTL_CLOSED reaches further. Without that a
+    US share opened at 9:00 in Berlin counted as current for twelve hours --
+    and the whole session from 15:30 on was never fetched (seen in the access
+    log, e.g. TSLA on 2026-09-14: fetched 09:00 UTC, shown at 18:03 UTC
+    without a reload).
+    """
     age = now - cov["fetched_at"]
-    ttl = config.CACHE_TTL_INTRADAY if cov["market_open"] else config.CACHE_TTL_CLOSED
-    return age < ttl
+    if cov["market_open"]:
+        return age < config.CACHE_TTL_INTRADAY
+    if age >= config.CACHE_TTL_CLOSED:
+        return False
+    start = _session_start(cov)
+    return start is None or now < start
 
 
 # --- Main access ----------------------------------------------------------

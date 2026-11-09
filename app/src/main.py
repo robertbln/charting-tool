@@ -20,7 +20,8 @@ import time
 from urllib.parse import urlsplit
 
 from fastapi import Body, Depends, FastAPI, Form, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -42,6 +43,14 @@ if not config.SECRET_KEY or len(config.SECRET_KEY) < 32:
 app = FastAPI(title=config.BRAND, docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
+
+# Compressed in the app rather than in the vhost: Apache's deflate.conf lists
+# text/html, CSS and JavaScript, but not application/json -- every chart left
+# the server uncompressed (1y: 182 KiB instead of 63, max: 4.9 MiB instead of
+# 1.4; measured on 2026-11-09). Level 5 rather than Starlette's default 9:
+# for a "max" chart that is a fraction of the time for nearly the same size.
+# Apache passes a response that is already encoded through unchanged.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
 
 def brand_parts() -> tuple[str, str]:
@@ -470,7 +479,28 @@ def api_chart(
         f"{symbol}  {period}  {len(data['daily']['dates'])} days, "
         f"{fetch.get('requests', 0)} Yahoo request(s)",
     )
-    return data
+    return _json_response(data)
+
+
+def _json_default(value):
+    """numpy scalars that slipped through -- as the plain Python value."""
+    if hasattr(value, "item"):
+        return value.item()
+    raise TypeError(f"{type(value).__name__} is not JSON serializable")
+
+
+def _json_response(data: dict) -> Response:
+    """The chart, serialized straight away.
+
+    Returning the dict would let FastAPI walk it with jsonable_encoder first
+    -- every one of the hundreds of thousands of values of a "max" chart,
+    which cost 580 ms on top of the 280 ms of json.dumps itself (measured on
+    2026-11-09). The data is plain lists and numbers already; the settings
+    match Starlette's JSONResponse, NaN included: allow_nan=False.
+    """
+    body = json.dumps(data, ensure_ascii=False, allow_nan=False,
+                      separators=(",", ":"), default=_json_default)
+    return Response(body.encode("utf-8"), media_type="application/json")
 
 
 @app.get("/api/closes")
