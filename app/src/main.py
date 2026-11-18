@@ -19,6 +19,8 @@ import threading
 import time
 from urllib.parse import urlsplit
 
+import orjson
+
 from fastapi import Body, Depends, FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.routing import APIRoute
@@ -26,7 +28,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import audit, auth, beta, config, db, fundamentals, i18n, portfolio, notices, series, yahoo
+from . import audit, auth, beta, config, db, fundamentals, i18n, notices, portfolio, series, store, yahoo
 
 logging.basicConfig(
     level=logging.INFO,
@@ -486,7 +488,7 @@ def api_chart(
 
 
 def _json_default(value):
-    """numpy scalars that slipped through -- as the plain Python value."""
+    """Anything orjson does not know by itself -- as the plain Python value."""
     if hasattr(value, "item"):
         return value.item()
     raise TypeError(f"{type(value).__name__} is not JSON serializable")
@@ -498,12 +500,17 @@ def _json_response(data: dict) -> Response:
     Returning the dict would let FastAPI walk it with jsonable_encoder first
     -- every one of the hundreds of thousands of values of a "max" chart,
     which cost 580 ms on top of the 280 ms of json.dumps itself (measured on
-    2026-11-09). The data is plain lists and numbers already; the settings
-    match Starlette's JSONResponse, NaN included: allow_nan=False.
+    2026-11-09). The data is plain lists and numbers already.
+
+    orjson rather than json.dumps: 16 ms instead of 325 ms for a "max" chart
+    of 5.5 MB, with the same content (measured on 2026-11-18). It writes UTF-8
+    and compact separators by itself, and numpy scalars directly. One
+    difference: a NaN that slipped past series._floats() becomes null, where
+    json.dumps(allow_nan=False) ended the request with a 500.
     """
-    body = json.dumps(data, ensure_ascii=False, allow_nan=False,
-                      separators=(",", ":"), default=_json_default)
-    return Response(body.encode("utf-8"), media_type="application/json")
+    body = orjson.dumps(data, default=_json_default,
+                        option=orjson.OPT_SERIALIZE_NUMPY)
+    return Response(body, media_type="application/json")
 
 
 @app.get("/api/closes")
@@ -677,8 +684,7 @@ def api_watchlist_quotes(user=Depends(require_user)):
             (user["user_id"],),
         ).fetchall()
 
-    items = []
-    for row in rows:
+    def one(row):
         entry = {"symbol": row["symbol"], "label": row["label"] or ""}
         try:
             entry.update(series.quote(row["symbol"]))
@@ -686,8 +692,9 @@ def api_watchlist_quotes(user=Depends(require_user)):
             # A single stubborn symbol must not tip over the list.
             log.warning("Favorite %s not available: %s", row["symbol"], exc)
             entry["error"] = str(exc)
-        items.append(entry)
-    return {"items": items}
+        return entry
+
+    return {"items": store.parallel(one, rows)}
 
 
 @app.delete("/api/watchlist/{symbol}")
@@ -720,18 +727,18 @@ def api_signals(user=Depends(require_user)):
         ).fetchall()
     held = _held_symbols(user["user_id"])
 
-    items = []
-    for row in rows:
+    def one(row):
         try:
             signal = notices.current_signal(row["symbol"], holding=row["symbol"] in held)
         except yahoo.YahooError as exc:
             # One unavailable symbol must not take the whole list down.
             log.warning("Signal for %s not available: %s", row["symbol"], exc)
-            continue
+            return None
         if signal:
             signal["label"] = row["label"] or ""
-            items.append(signal)
-    return {"items": items}
+        return signal
+
+    return {"items": [s for s in store.parallel(one, rows) if s]}
 
 
 @app.get("/api/positions")

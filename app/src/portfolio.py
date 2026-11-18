@@ -24,6 +24,7 @@ Rules of the bookkeeping:
 import datetime
 import logging
 import re
+import threading
 
 import pandas as pd
 
@@ -248,12 +249,17 @@ def summary(rows: list[dict]) -> dict:
     totals = {"invested": 0.0, "value": 0.0, "unrealized": 0.0, "day": 0.0,
               "realized": sum(r["profit"] for r in book["realized"]),
               "missing": 0}
-    for pos in book["positions"]:
+    def fetch(pos):
         try:
-            quote = series.quote(pos["symbol"])
+            return series.quote(pos["symbol"])
         except yahoo.YahooError as exc:
             # One unavailable symbol must not take the whole list down.
             log.warning("Quote for %s not available: %s", pos["symbol"], exc)
+            return None
+
+    quotes = store.parallel(fetch, book["positions"])
+    for pos, quote in zip(book["positions"], quotes):
+        if quote is None:
             pos["error"] = True
             totals["missing"] += 1
             continue
@@ -279,6 +285,9 @@ def summary(rows: list[dict]) -> dict:
     # The depot's beta: each position's beta weighted by its value. Positions
     # without a beta (too young) drop out of numerator and denominator alike.
     weighted, covered = 0.0, 0.0
+    # One after the other on purpose, unlike the quotes above: every beta also
+    # loads the benchmark, and four threads would fetch and write ^GSPC at
+    # the same time. beta.get() caches per day, so this costs once a day.
     for pos in book["positions"]:
         if "value" in pos and totals["value"]:
             pos["weight"] = pos["value"] / totals["value"] * 100
@@ -380,13 +389,26 @@ def _ttwror(book: dict) -> dict:
     first = min(tr["trade_date"] for tr in trades)
     since = int((pd.Timestamp(first, tz="UTC") - pd.Timedelta(days=10)).timestamp())
 
-    closes = {}
-    for symbol in {tr["symbol"] for tr in trades}:
+    # One missing symbol already leaves the TTWROR out. The rest are then not
+    # fetched any more -- during a Yahoo outage that would only add load.
+    failed = threading.Event()
+
+    def load(symbol):
+        if failed.is_set():
+            return None
         try:
-            frame = store.load(symbol, "1d", since).frame["Close"].dropna()
+            return store.load(symbol, "1d", since).frame["Close"].dropna()
         except yahoo.YahooError as exc:
             log.warning("No closes for %s, TTWROR left out: %s", symbol, exc)
-            return {"ttwror": None}
+            failed.set()
+            return None
+
+    symbols = sorted({tr["symbol"] for tr in trades})
+    frames = store.parallel(load, symbols)
+    if any(frame is None for frame in frames):
+        return {"ttwror": None}
+    closes = {}
+    for symbol, frame in zip(symbols, frames):
         frame.index = frame.index.strftime("%Y-%m-%d")
         closes[symbol] = frame[~frame.index.duplicated(keep="last")]
     prices = pd.DataFrame(closes).sort_index().ffill()

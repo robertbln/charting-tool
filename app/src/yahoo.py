@@ -8,6 +8,7 @@ user agent -- without one Yahoo answers with 429.
 
 import logging
 import re
+import threading
 import time
 
 import httpx
@@ -35,6 +36,13 @@ client = httpx.Client(timeout=25, headers=HEADERS, follow_redirects=True,
                       limits=httpx.Limits(max_connections=8,
                                           max_keepalive_connections=4,
                                           keepalive_expiry=60))
+
+# At most four chart requests to Yahoo at the same time, across the whole
+# process. Lists of symbols are loaded side by side (store.parallel), and the
+# browser asks for the watchlist, the signals and the chart at once -- without
+# a common cap that came to eight and more parallel requests whenever the
+# store had gone stale, and Yahoo answers such a burst with 429.
+FETCH_SLOTS = threading.BoundedSemaphore(4)
 
 # Allowed are letters, digits and the characters Yahoo uses in symbols: dot
 # (BMW.DE), hyphen (BTC-USD), caret (^VIX), equals sign (EURUSD=X).
@@ -99,7 +107,8 @@ def fetch(symbol: str, interval: str, *, period1: int | None = None,
         params["period2"] = int(period2)
 
     try:
-        resp = client.get(CHART_URL.format(symbol=symbol), params=params)
+        with FETCH_SLOTS:
+            resp = client.get(CHART_URL.format(symbol=symbol), params=params)
         resp.raise_for_status()
         body = resp.json()
     except (httpx.HTTPError, ValueError) as exc:

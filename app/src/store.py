@@ -26,7 +26,9 @@ import datetime
 import json
 import logging
 import math
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
@@ -294,8 +296,10 @@ def _frame(symbol: str, interval: str, start_ts: int) -> pd.DataFrame:
             (symbol, interval, start_ts),
         ).fetchall()
 
+    # Plain tuples rather than a dict per row: pandas then need not match
+    # every value to its column by name.
     frame = pd.DataFrame(
-        [dict(r) for r in rows],
+        [tuple(r) for r in rows],
         columns=["ts", "open", "high", "low", "close", "volume"],
     )
     frame.index = pd.to_datetime(frame.pop("ts"), unit="s", utc=True)
@@ -338,9 +342,29 @@ def _is_current(cov: dict, now: int) -> bool:
 
 # --- Main access ----------------------------------------------------------
 
+# One lock per symbol and resolution. Two threads loading the same series --
+# the watchlist and the signals ask for the same favorites at the same time
+# -- would otherwise both fetch the stale edge from Yahoo, and during a split
+# reload one could read the store in the moment between _forget() and
+# _save_bars() and get an empty series. With the lock the second one waits
+# and then finds the store current.
+_locks: dict[tuple[str, str], threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _lock(symbol: str, interval: str) -> threading.Lock:
+    with _locks_guard:
+        return _locks.setdefault((symbol, interval), threading.Lock())
+
+
 def load(symbol: str, interval: str, start_ts: int) -> Result:
     """Returns the series from start_ts on, reloading only what is missing."""
     symbol = symbol.upper()
+    with _lock(symbol, interval):
+        return _load(symbol, interval, start_ts)
+
+
+def _load(symbol: str, interval: str, start_ts: int) -> Result:
     start_ts = max(0, int(start_ts))
     now = int(time.time())
 
@@ -442,6 +466,34 @@ def load(symbol: str, interval: str, start_ts: int) -> Result:
                          fetched_at=cov["fetched_at"])
 
     return Result(_frame(symbol, interval, start_ts), meta, requests, new_bars, stale)
+
+
+# Lists of symbols (favorites, signals, portfolio positions) are loaded side
+# by side rather than one after the other. Once the store has gone stale --
+# 15 minutes during trading hours -- every symbol needs a request to Yahoo,
+# and in a row they added up: 13 favorites took 1.6 s, 4.5 s for the
+# portfolio (measured on 2026-11-18). Four at a time per call; the cap on
+# Yahoo across all requests together is yahoo.FETCH_SLOTS.
+PARALLEL_LOADS = 4
+
+
+def parallel(func, items) -> list:
+    """func applied to every item, four at a time, results in list order.
+
+    If func raises, the items not yet started are cancelled and the first
+    exception in list order is raised -- after the ones already running have
+    finished, which cannot be interrupted. Callers that want to carry on
+    past a single failure catch it inside func.
+    """
+    items = list(items)
+    if len(items) <= 1:
+        return [func(item) for item in items]
+    pool = ThreadPoolExecutor(max_workers=PARALLEL_LOADS)
+    futures = [pool.submit(func, item) for item in items]
+    try:
+        return [future.result() for future in futures]
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _bar_seconds(interval: str) -> int:

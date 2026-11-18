@@ -5,6 +5,7 @@ import datetime
 import logging
 import math
 
+import numpy as np
 import pandas as pd
 
 from . import i18n, indicators, signals, store, yahoo
@@ -37,10 +38,54 @@ def _clean(value):
     return value
 
 
+def _floats(values) -> list:
+    """A whole column as a JSON-ready list: floats, NaN and Inf as None.
+
+    The same result as _clean() value by value, but the test for NaN runs in
+    numpy over the whole array and only the gaps are touched in Python.
+    Value by value it was 266,000 calls for a "max" chart -- 0.36 s, more
+    than half of building the response (measured on 2026-11-18).
+    """
+    array = np.asarray(values, dtype="float64")
+    out = array.tolist()
+    for i in np.flatnonzero(~np.isfinite(array)).tolist():
+        out[i] = None
+    return out
+
+
+def _dates(index) -> list:
+    """The dates of an index as "YYYY-MM-DD", formatted in one go.
+
+    numpy rather than index.strftime(): pandas formats every date through
+    Python's strftime, 0.16 s for the dates of a "max" chart (measured on
+    2026-11-18). tz_localize(None) keeps the wall time of the index's zone,
+    so the date is the one strftime would have printed.
+    """
+    if not len(index):
+        return []
+    if getattr(index, "tz", None) is not None:
+        index = index.tz_localize(None)
+    return np.datetime_as_string(index.values, unit="D").tolist()
+
+
+def _ohlc(df: pd.DataFrame) -> list:
+    """Candles in ECharts order: open, close, low, high."""
+    return [list(bar) for bar in zip(
+        _floats(df["Open"]), _floats(df["Close"]),
+        _floats(df["Low"]), _floats(df["High"]),
+    )]
+
+
+def _crosses(window: pd.DataFrame, flag: str) -> list:
+    """The days a cross column marks, with the close of that day."""
+    hits = window["Close"][window[flag].astype(bool)]
+    return [{"date": d, "value": v} for d, v in zip(_dates(hits.index), _floats(hits))]
+
+
 def _column(df: pd.DataFrame, name: str) -> list:
     if name not in df:
         return []
-    return [_clean(v) for v in df[name].astype("float64").tolist()]
+    return _floats(df[name])
 
 
 # Window for the watchlist: enough for the sparkline and the daily change,
@@ -76,7 +121,7 @@ def quote(symbol: str) -> dict:
         "exchange": meta.get("fullExchangeName", ""),
         "last": _clean(last),
         "change_pct": _clean((last - previous) / previous * 100) if previous else None,
-        "history": [_clean(v) for v in closes.tail(30).tolist()],
+        "history": _floats(closes.tail(30)),
         "stale": result.stale,
     }
 
@@ -168,13 +213,8 @@ def _monthly_block(symbol: str, window: pd.DataFrame) -> tuple[dict, dict, dict]
     }
 
     block = {
-        "dates": [d.strftime("%Y-%m-%d") for d in monthly.index],
-        "ohlc": [
-            [_clean(o), _clean(c), _clean(l), _clean(h)]
-            for o, c, l, h in zip(
-                monthly["Open"], monthly["Close"], monthly["Low"], monthly["High"]
-            )
-        ],
+        "dates": _dates(monthly.index),
+        "ohlc": _ohlc(monthly),
         "close": _column(monthly, "Close"),
         "ema8": _column(monthly, "EMA_8"),
         "ema12": _column(monthly, "EMA_12"),
@@ -207,9 +247,7 @@ def _monthly_block(symbol: str, window: pd.DataFrame) -> tuple[dict, dict, dict]
     for n in (8, 12):
         values = indicators.ema(monthly["Close"], n)
         values.index = values.index.tz_convert(None).to_period("M")
-        overlay[f"m_ema{n}"] = [
-            _clean(v) for v in values.shift(1).reindex(periods).tolist()
-        ]
+        overlay[f"m_ema{n}"] = _floats(values.shift(1).reindex(periods))
 
     return block, status, overlay
 
@@ -312,8 +350,8 @@ def closes(symbol: str, rng: str, start=None, end=None) -> dict:
     return {
         "symbol": symbol.upper(),
         "currency": (result.meta or {}).get("currency", ""),
-        "dates": [d.strftime("%Y-%m-%d") for d in frame.index],
-        "close": [_clean(v) for v in frame.astype("float64").tolist()],
+        "dates": _dates(frame.index),
+        "close": _floats(frame),
     }
 
 
@@ -389,7 +427,7 @@ def build(symbol: str, rng: str, start=None, end=None, language: str = "de") -> 
         # weeks-long straight line.
         aligned = aligned.ffill(limit=4)
 
-        vix_values = [_clean(v) for v in aligned.tolist()]
+        vix_values = _floats(aligned)
         if not any(v is not None for v in vix_values):
             vix_values = []
     except yahoo.YahooError:
@@ -403,7 +441,7 @@ def build(symbol: str, rng: str, start=None, end=None, language: str = "de") -> 
         monthly_block, monthly_status, overlay = {}, {}, {}
 
     meta = daily_result.meta or {}
-    dates = [d.strftime("%Y-%m-%d") for d in window.index]
+    dates = _dates(window.index)
 
     return {
         "symbol": (meta.get("symbol") or symbol).upper(),
@@ -444,23 +482,12 @@ def build(symbol: str, rng: str, start=None, end=None, language: str = "de") -> 
             # Monthly EMA levels as a staircase over the daily series.
             "m_ema8": overlay.get("m_ema8", []),
             "m_ema12": overlay.get("m_ema12", []),
-            "golden_cross": [
-                {"date": d.strftime("%Y-%m-%d"), "value": _clean(window.loc[d, "Close"])}
-                for d in window.index[window["Golden_Cross"]]
-            ],
-            "death_cross": [
-                {"date": d.strftime("%Y-%m-%d"), "value": _clean(window.loc[d, "Close"])}
-                for d in window.index[window["Death_Cross"]]
-            ],
+            "golden_cross": _crosses(window, "Golden_Cross"),
+            "death_cross": _crosses(window, "Death_Cross"),
         },
         "weekly": {
-            "dates": [d.strftime("%Y-%m-%d") for d in weekly.index],
-            "ohlc": [
-                [_clean(o), _clean(c), _clean(l), _clean(h)]
-                for o, c, l, h in zip(
-                    weekly["Open"], weekly["Close"], weekly["Low"], weekly["High"]
-                )
-            ],
+            "dates": _dates(weekly.index),
+            "ohlc": _ohlc(weekly),
             "close": _column(weekly, "Close"),
             "sma10": _column(weekly, "SMA_10"),
             "sma12": _column(weekly, "SMA_12"),
