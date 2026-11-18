@@ -100,7 +100,7 @@ def quote(symbol: str) -> dict:
     current, the call costs no request to Yahoo.
     """
     start_ts = int(
-        (pd.Timestamp.utcnow() - pd.Timedelta(days=QUOTE_DAYS)).timestamp()
+        (pd.Timestamp.now("UTC") - pd.Timedelta(days=QUOTE_DAYS)).timestamp()
     )
     result = store.load(symbol, "1d", start_ts)
     closes = result.frame["Close"].dropna()
@@ -147,7 +147,7 @@ def _monthly_block(symbol: str, window: pd.DataFrame) -> tuple[dict, dict, dict]
     # Is the last bar still running? Compared over the calendar month, not
     # over the time of day -- for the running month Yahoo sets sometimes the
     # first of the month, sometimes the current moment.
-    today = pd.Timestamp.utcnow()
+    today = pd.Timestamp.now("UTC")
     last = monthly.index[-1]
     running = (last.year, last.month) == (today.year, today.month)
 
@@ -293,7 +293,7 @@ def _window_bounds(rng: str, start, end):
     to size, "load_from" is the point from which bars are loaded -- that is,
     including the run-up for the long averages.
     """
-    now = pd.Timestamp.utcnow()
+    now = pd.Timestamp.now("UTC")
 
     if start is not None or end is not None:
         # Freely chosen period. If a bound is missing, it stays open.
